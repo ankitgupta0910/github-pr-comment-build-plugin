@@ -95,13 +95,17 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
     }
 
     /**
-     * Number of times to retry the job match after requesting a rescan.
+     * Number of times to retry the job match after requesting a rescan. 12 attempts at 10s each gives a
+     * 2-minute window - observed indexing latency for a new PR ranged up to ~90s in manual testing, so this
+     * leaves some margin rather than cutting it close.
      */
-    private static final int RESCAN_RETRY_ATTEMPTS = 6;
+    private static final int RESCAN_RETRY_ATTEMPTS = 12;
     /**
-     * Delay before each rescan-retry attempt, giving the folder computation time to finish indexing.
+     * Delay before each rescan-retry attempt, giving the folder computation time to finish indexing. Retries
+     * only re-check already-loaded in-memory state (no GitHub API calls), so a longer window here does not
+     * add the repeated-rescan "traffic/churn" that opting into this flag is meant to avoid.
      */
-    private static final long RESCAN_RETRY_DELAY_MILLIS = 5000L;
+    private static final long RESCAN_RETRY_DELAY_MILLIS = 10000L;
 
     /**
      * {@code onEvent()} (and therefore this method) runs directly on the thread handling GitHub's webhook HTTP
@@ -270,6 +274,11 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
      *
      * <p>Deliberately skips {@link OrganizationFolder} owners: rescanning an entire organization folder in
      * response to a single PR event would be far more expensive than the targeted case this is meant to help.
+     *
+     * <p><b>Known limitation:</b> only recognizes the flag when the branch source uses
+     * {@link DefaultBranchPropertyStrategy} (the common case, and what this was tested against). A project
+     * using a different {@link BranchPropertyStrategy} (e.g. per-branch-name overrides) will not be detected
+     * here even if the flag is set on it, and will fall back to the pre-existing (unfixed) behavior.
      *
      * @return true if a rescan was requested for at least one matching project
      */
