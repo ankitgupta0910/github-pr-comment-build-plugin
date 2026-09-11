@@ -29,6 +29,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -98,14 +99,25 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
      * Number of times to retry the job match after requesting a rescan. 12 attempts at 10s each gives a
      * 2-minute window - observed indexing latency for a new PR ranged up to ~90s in manual testing, so this
      * leaves some margin rather than cutting it close.
+     *
+     * <p>Package-private and non-final (rather than a private constant) purely so tests can substitute a
+     * much smaller window and observe the retry loop actually exhaust in a reasonable amount of test time.
      */
-    private static final int RESCAN_RETRY_ATTEMPTS = 12;
+    static int rescanRetryAttempts = 12;
     /**
      * Delay before each rescan-retry attempt, giving the folder computation time to finish indexing. Retries
      * only re-check already-loaded in-memory state (no GitHub API calls), so a longer window here does not
      * add the repeated-rescan "traffic/churn" that opting into this flag is meant to avoid.
+     *
+     * <p>Package-private and non-final for the same test-tunability reason as {@link #rescanRetryAttempts}.
      */
-    private static final long RESCAN_RETRY_DELAY_MILLIS = 10000L;
+    static long rescanRetryDelayMillis = 10000L;
+    /**
+     * Number of times {@link #attemptMatch} has been called, across all instances. Package-private purely for
+     * tests to assert the retry loop ran (and stopped) the expected number of times; not used by production
+     * logic.
+     */
+    static final AtomicInteger attemptMatchInvocations = new AtomicInteger();
 
     /**
      * {@code onEvent()} (and therefore this method) runs directly on the thread handling GitHub's webhook HTTP
@@ -130,7 +142,7 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
                         }
                 );
                 scheduleRetry(changedRepository, pullRequestId, author, postStartParam, getCauseFunction,
-                        alreadyTriggeredJobs, RESCAN_RETRY_ATTEMPTS);
+                        alreadyTriggeredJobs, rescanRetryAttempts);
                 return;
             }
 
@@ -148,8 +160,12 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
     /**
      * Schedules a single retry attempt on the shared Jenkins background timer, re-scheduling itself (rather
      * than blocking a thread with {@code Thread.sleep}) until either a job matches or attempts run out.
+     *
+     * <p>Package-private (rather than private) so tests can invoke the retry-and-exhaust behavior directly,
+     * without needing a real, network-reachable {@code GitHubSCMSource} to drive it via
+     * {@link #requestRescanIfConfigured}.
      */
-    private void scheduleRetry(GitHubRepositoryName changedRepository, int pullRequestId, String author,
+    void scheduleRetry(GitHubRepositoryName changedRepository, int pullRequestId, String author,
                                U postStartParam, BiFunction<Job<?, ?>, T, Cause> getCauseFunction,
                                Set<Job<?, ?>> alreadyTriggeredJobs, int attemptsRemaining) {
         Timer.get().schedule(() -> {
@@ -177,7 +193,7 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
                         }
                 );
             }
-        }, RESCAN_RETRY_DELAY_MILLIS, TimeUnit.MILLISECONDS);
+        }, rescanRetryDelayMillis, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -189,6 +205,7 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
     private boolean attemptMatch(GitHubRepositoryName changedRepository, int pullRequestId, String author,
                                   U postStartParam, BiFunction<Job<?, ?>, T, Cause> getCauseFunction,
                                   Set<Job<?, ?>> alreadyTriggeredJobs) {
+        attemptMatchInvocations.incrementAndGet();
         boolean jobFound = false;
         for (final SCMSourceOwner owner : SCMSourceOwners.all()) {
             for (SCMSource source : owner.getSCMSources()) {
@@ -274,6 +291,8 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
      *
      * <p>Deliberately skips {@link OrganizationFolder} owners: rescanning an entire organization folder in
      * response to a single PR event would be far more expensive than the targeted case this is meant to help.
+     * ({@link OrganizationFolder} does not extend {@link MultiBranchProject}, so this exclusion falls out of
+     * the type check in {@link #findProjectsNeedingRescan} rather than needing special-case logic.)
      *
      * <p><b>Known limitation:</b> only recognizes the flag when the branch source uses
      * {@link DefaultBranchPropertyStrategy} (the common case, and what this was tested against). A project
@@ -283,6 +302,31 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
      * @return true if a rescan was requested for at least one matching project
      */
     private boolean requestRescanIfConfigured(GitHubRepositoryName changedRepository) {
+        Set<MultiBranchProject<?, ?>> toRescan = findProjectsNeedingRescan(changedRepository);
+        for (MultiBranchProject<?, ?> project : toRescan) {
+            LOGGER.log(Level.INFO, "Requesting rescan of {0} after PR event on {1}:{2}/{3} matched no job",
+                    new Object[] {
+                            project.getFullName(), changedRepository.getHost(),
+                            changedRepository.getUserName(), changedRepository.getRepositoryName()
+                    }
+            );
+            ((ComputedFolder<?>) project).scheduleBuild(0, new RescanCause());
+        }
+        return !toRescan.isEmpty();
+    }
+
+    /**
+     * Pure lookup (no side effects - does not schedule anything) of {@link MultiBranchProject}s matching the
+     * changed repository whose configured (project-level, not per-job) branch property template has a
+     * {@link TriggerBranchProperty} of this subscriber's trigger type with {@code rescanOnMissingJob} enabled.
+     *
+     * <p>Split out from {@link #requestRescanIfConfigured} - and left package-private - specifically so tests
+     * can verify this decision logic directly, without needing to observe a scheduled build (which would
+     * otherwise require either real network access for the SCM source or Jenkins queue/timing assertions).
+     *
+     * @return the matching projects, empty if none
+     */
+    Set<MultiBranchProject<?, ?>> findProjectsNeedingRescan(GitHubRepositoryName changedRepository) {
         Set<MultiBranchProject<?, ?>> toRescan = new LinkedHashSet<>();
         for (final SCMSourceOwner owner : SCMSourceOwners.all()) {
             if (!(owner instanceof MultiBranchProject<?, ?> multiBranchProject)) {
@@ -310,16 +354,7 @@ public abstract class BasePRGHEventSubscriber<T extends TriggerBranchProperty, U
                 }
             }
         }
-        for (MultiBranchProject<?, ?> project : toRescan) {
-            LOGGER.log(Level.INFO, "Requesting rescan of {0} after PR event on {1}:{2}/{3} matched no job",
-                    new Object[] {
-                            project.getFullName(), changedRepository.getHost(),
-                            changedRepository.getUserName(), changedRepository.getRepositoryName()
-                    }
-            );
-            ((ComputedFolder<?>) project).scheduleBuild(0, new RescanCause());
-        }
-        return !toRescan.isEmpty();
+        return toRescan;
     }
 
     /**
